@@ -1005,3 +1005,313 @@ def sa_ru_apply(
         "spec":       spec,
         "model":      res["model"],
     }
+
+
+# ---------------------------------------------------------------------------
+# 8. Пакетная обработка нескольких рядов
+# ---------------------------------------------------------------------------
+
+# Настройки по умолчанию для sa_ru_batch
+_BATCH_DEFAULT_CONFIG: Dict[str, Any] = {
+    "calendar_mode":      "basic",
+    "include_easter":     True,
+    "transform_function": "none",
+    "forecast_months":    36,
+    "seasonality_alpha":  0.05,
+    "arima_order":        _DEFAULT_ORDER,
+    "arima_seasonal":     _DEFAULT_SEASONAL,
+}
+
+# Параметры sa_ru(), которые можно задавать на уровне серии
+_SERIES_LEVEL_PARAMS = {
+    "calendar_mode", "include_easter", "transform_function",
+    "forecast_months", "seasonality_alpha", "arima_order", "arima_seasonal",
+    "center_start", "center_end",
+    "calendar_sheet", "calendar_date_col",
+    "calendar_workday_col", "calendar_holiday_col", "calendar_easter_col",
+}
+
+
+def sa_ru_batch(
+    df: pd.DataFrame,
+    calendar_file: Union[str, Path],
+    format: str = "wide",
+    date_col: str = "date",
+    series_col: str = "series_id",
+    value_col: str = "value",
+    default_config: Optional[Dict[str, Any]] = None,
+    series_configs: Optional[Dict[str, Dict[str, Any]]] = None,
+    output_long: bool = True,
+    fail_on_error: bool = False,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """Seasonal adjustment of **multiple** time series in a single call.
+
+    Поддерживает wide и long форматы. Каждый ряд может иметь собственные
+    настройки через ``series_configs``.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Данные в wide или long формате.
+
+        **Wide** (``format='wide'``) — дата в одной колонке, каждый ряд —
+        отдельная колонка::
+
+            date        | CPI   | PPI   | IP
+            2015-01-01  | 101.2 | 85.4  | 112.3
+
+        **Long** (``format='long'``) — три колонки: дата, идентификатор ряда,
+        значение::
+
+            date        | series_id | value
+            2015-01-01  | CPI       | 101.2
+            2015-01-01  | PPI       | 85.4
+
+    calendar_file : str or Path
+        Путь к ``russia_calendar.xlsx``.
+    format : {"wide", "long"}
+        Формат входных данных. По умолчанию ``"wide"``.
+    date_col : str
+        Колонка с датами (для обоих форматов).
+    series_col : str
+        Колонка с именами рядов (только для ``format='long'``).
+    value_col : str
+        Колонка со значениями (только для ``format='long'``).
+    default_config : dict, optional
+        Настройки ``sa_ru()`` по умолчанию для всех рядов.
+        Если ``None`` — используются значения по умолчанию из ``sa_ru()``.
+        Допустимые ключи: ``calendar_mode``, ``include_easter``,
+        ``transform_function``, ``forecast_months``, ``arima_order``,
+        ``arima_seasonal``, ``center_start``, ``center_end``, и др.
+    series_configs : dict of dict, optional
+        Индивидуальные настройки для конкретных рядов — перегружают
+        ``default_config``. Ключи верхнего уровня — имена рядов::
+
+            series_configs = {
+                "CPI": {"transform_function": "log"},
+                "PPI": {"calendar_mode": "extended", "include_easter": False},
+                "IP":  {"calendar_mode": "auto"},
+            }
+
+    output_long : bool
+        Если ``True`` — результат содержит ключ ``"combined"`` с единым
+        long DataFrame по всем рядам. По умолчанию ``True``.
+    fail_on_error : bool
+        Если ``True`` — ошибка в одном ряду прерывает всё.
+        Если ``False`` — ошибка записывается, обработка продолжается.
+        По умолчанию ``False``.
+    verbose : bool
+        Печатать прогресс. По умолчанию ``True``.
+
+    Returns
+    -------
+    dict with keys:
+        * ``"results"`` — dict: имя_ряда → полный вывод ``sa_ru()``.
+        * ``"summary"`` — pd.DataFrame: сводная таблица по всем рядам.
+        * ``"combined"`` — pd.DataFrame (long): все SA-ряды в одной таблице
+          (только если ``output_long=True``).
+        * ``"errors"`` — dict: имя_ряда → текст ошибки.
+
+    Examples
+    --------
+    >>> results = sa_ru_batch(
+    ...     df            = wide_df,
+    ...     calendar_file = "russia_calendar.xlsx",
+    ...     format        = "wide",
+    ...     default_config = {"calendar_mode": "basic", "include_easter": True},
+    ...     series_configs = {
+    ...         "CPI": {"transform_function": "log"},
+    ...         "IP":  {"calendar_mode": "auto"},
+    ...     },
+    ... )
+    >>> results["summary"]
+    >>> results["combined"]                    # все ряды в one DataFrame
+    >>> results["results"]["CPI"]["data"]      # SA-ряд для CPI
+    >>> results["results"]["CPI"]["aic"]       # AIC модели CPI
+    """
+    _say = (lambda msg: print(msg)) if verbose else (lambda msg: None)
+
+    # --- Слияние default_config с глобальными умолчаниями
+    base_cfg = dict(_BATCH_DEFAULT_CONFIG)
+    if default_config:
+        base_cfg.update(default_config)
+    if series_configs is None:
+        series_configs = {}
+
+    # --- Приводим к long-формату
+    long_df = _to_long_format(df, format, date_col, series_col, value_col)
+    all_series = sorted(long_df[series_col].unique())
+    n_total = len(all_series)
+    _say(f"Пакетная обработка: {n_total} рядов")
+
+    # Предупреждение об неизвестных именах в series_configs
+    unknown = set(series_configs) - set(all_series)
+    if unknown:
+        import warnings
+        warnings.warn(
+            f"В series_configs есть ряды, которых нет в df: {sorted(unknown)}",
+            UserWarning, stacklevel=2
+        )
+
+    # --- Обрабатываем каждый ряд
+    results: Dict[str, Any] = {}
+    errors:  Dict[str, str] = {}
+    summary_rows: List[Dict] = []
+
+    for idx, sname in enumerate(all_series, start=1):
+        _say(f"  [{idx}/{n_total}] {sname} ...")
+
+        # Данные ряда
+        sub = (
+            long_df[long_df[series_col] == sname][[date_col, value_col]]
+            .rename(columns={date_col: "date", value_col: "value"})
+            .copy()
+        )
+
+        # Итоговая конфигурация для этого ряда
+        cfg = dict(base_cfg)
+        cfg.update({k: v for k, v in series_configs.get(sname, {}).items()
+                    if k in _SERIES_LEVEL_PARAMS})
+
+        try:
+            res = sa_ru(
+                df=sub,
+                calendar_file=calendar_file,
+                date_col="date",
+                value_col="value",
+                verbose=False,
+                **{k: v for k, v in cfg.items() if k != "calendar_file"},
+            )
+            results[sname] = res
+            status = "OK"
+            error_msg = None
+            _say(
+                f"    OK | модель={res['chosen_model']} "
+                f"| transform={res['transform']} "
+                f"| AIC={res['aic']:.2f}"
+            )
+        except Exception as exc:
+            error_msg = str(exc)
+            errors[sname] = error_msg
+            status = "ERROR"
+            _say(f"    ОШИБКА: {error_msg}")
+            if fail_on_error:
+                raise
+
+        summary_rows.append({
+            "series_id":            sname,
+            "status":               status,
+            "chosen_model":         results[sname]["chosen_model"] if status == "OK" else None,
+            "transform":            results[sname]["transform"]     if status == "OK" else None,
+            "aic":                  results[sname]["aic"]           if status == "OK" else np.nan,
+            "bic":                  results[sname]["bic"]           if status == "OK" else np.nan,
+            "seasonality_detected": results[sname]["seasonality_detected"] if status == "OK" else None,
+            "n_obs":                len(sub),
+            "error_msg":            error_msg,
+        })
+
+    summary_df = pd.DataFrame(summary_rows)
+    ok_n  = (summary_df["status"] == "OK").sum()
+    err_n = (summary_df["status"] == "ERROR").sum()
+    _say(f"Готово: успешно={ok_n}, ошибок={err_n}")
+    if verbose:
+        print(summary_df[["series_id", "status", "chosen_model", "transform",
+                           "aic", "seasonality_detected"]].to_string(index=False))
+
+    # --- Объединённый long DataFrame
+    combined_df = None
+    if output_long and results:
+        parts = []
+        for sname, res in results.items():
+            part = res["data"].copy()
+            part.insert(0, "series_id", sname)
+            parts.append(part)
+        combined_df = pd.concat(parts, ignore_index=True)
+
+    return {
+        "results":  results,
+        "summary":  summary_df,
+        "combined": combined_df,
+        "errors":   errors,
+    }
+
+
+def _to_long_format(
+    df: pd.DataFrame,
+    format: str,
+    date_col: str,
+    series_col: str,
+    value_col: str,
+) -> pd.DataFrame:
+    """Convert wide or long DataFrame to a unified long format.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Входные данные.
+    format : {"wide", "long"}
+        Формат входных данных.
+    date_col, series_col, value_col : str
+        Названия ключевых колонок.
+
+    Returns
+    -------
+    pd.DataFrame
+        Long-форматный DataFrame с колонками ``date_col``, ``series_col``, ``value_col``.
+    """
+    if format == "long":
+        missing = [c for c in [date_col, series_col, value_col] if c not in df.columns]
+        if missing:
+            raise ValueError(f"В df (long) не найдены колонки: {missing}")
+        return df[[date_col, series_col, value_col]].copy()
+
+    # wide -> long
+    if date_col not in df.columns:
+        raise ValueError(f"Колонка '{date_col}' не найдена в df (wide).")
+    value_cols = [c for c in df.columns if c != date_col]
+    if not value_cols:
+        raise ValueError("В df (wide) нет колонок со значениями (только дата).")
+
+    return df.melt(
+        id_vars=date_col,
+        value_vars=value_cols,
+        var_name=series_col,
+        value_name=value_col,
+    )
+
+
+def sa_ru_batch_to_excel(
+    batch_result: Dict[str, Any],
+    path: Union[str, Path] = "sa_results.xlsx",
+    include_summary: bool = True,
+) -> str:
+    """Save ``sa_ru_batch()`` results to a multi-sheet Excel file.
+
+    Требует пакет ``openpyxl``.
+
+    Parameters
+    ----------
+    batch_result : dict
+        Вывод ``sa_ru_batch()``.
+    path : str or Path
+        Путь к выходному .xlsx файлу. По умолчанию ``"sa_results.xlsx"``.
+    include_summary : bool
+        Добавить лист «Summary» с общей сводкой. По умолчанию ``True``.
+
+    Returns
+    -------
+    str
+        Абсолютный путь к созданному файлу.
+    """
+    path = str(path)
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        if include_summary and batch_result.get("summary") is not None:
+            batch_result["summary"].to_excel(writer, sheet_name="Summary", index=False)
+        for sname, res in batch_result.get("results", {}).items():
+            sheet = sname[:31]  # Excel limit: 31 chars
+            res["data"].to_excel(writer, sheet_name=sheet, index=False)
+
+    abs_path = os.path.abspath(path)
+    print(f"Сохранено: {abs_path}")
+    return abs_path
